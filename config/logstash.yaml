@@ -1,0 +1,191 @@
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: "logstash-pdb"
+  labels:
+    app: "logstash"
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app: "logstash"
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: logstash-pipeline
+  labels:
+    app: "logstash"
+data:
+  logstash.conf: |
+    input {
+      http {
+        port => 10000
+        codec => protobuf {
+          class_name => "opentelemetry.proto.collector.logs.v1.ExportLogsServiceRequest"
+          class_file => '/opt/protobuf/opentelemetry/proto/collector/logs/v1/logs_service_pb.rb'
+          protobuf_root_directory => "/opt/protobuf"
+          protobuf_version => 3
+        }
+      }
+    }
+    
+    output {
+      http {
+        id => "mock_http_output"
+        format => "json"
+        http_method => "post"
+        url => "http://mock-http-output:8080/ingest"
+      }
+    }
+---
+kind: Service
+apiVersion: v1
+metadata:
+  name: "logstash-headless"
+  labels:
+    app: "logstash"
+spec:
+  clusterIP: None
+  selector:
+    app: "logstash"
+  ports:
+    - name: http
+      port: 9600
+---
+kind: Service
+apiVersion: v1
+metadata:
+  name: "logstash-pipelines-inputs"
+  labels:
+    app: "logstash"
+spec:
+  selector:
+    app: "logstash"
+  ports:
+    - name: input-10000
+      port: 10000
+      protocol: TCP
+      targetPort: 10000
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: logstash
+  labels:
+    app: "logstash"
+spec:
+  serviceName: logstash-headless
+  selector:
+    matchLabels:
+      app: "logstash"
+  replicas: 1
+  podManagementPolicy: Parallel
+  updateStrategy:
+    type: RollingUpdate
+  template:
+    metadata:
+      name: "logstash"
+      labels:
+        app: "logstash"
+    spec:
+      securityContext:
+        fsGroup: 1000
+        runAsUser: 1000
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchExpressions:
+                  - key: app
+                    operator: In
+                    values:
+                      - "logstash"
+              topologyKey: kubernetes.io/hostname
+      terminationGracePeriodSeconds: 120
+      volumes:
+        - name: logstashpipeline
+          configMap:
+            name: logstash-pipeline
+      containers:
+        - name: "logstash"
+          securityContext:
+            capabilities:
+              drop:
+                - ALL
+            runAsNonRoot: true
+            runAsUser: 1000
+          image: "logstash:v0"
+          imagePullPolicy: "IfNotPresent"
+          livenessProbe:
+            failureThreshold: 3
+            httpGet:
+              path: /
+              port: http
+            initialDelaySeconds: 300
+            periodSeconds: 10
+            successThreshold: 1
+            timeoutSeconds: 5
+          readinessProbe:
+            failureThreshold: 3
+            httpGet:
+              path: /
+              port: http
+            initialDelaySeconds: 60
+            periodSeconds: 10
+            successThreshold: 3
+            timeoutSeconds: 5
+          ports:
+            - name: http
+              containerPort: 9600
+            - name: input-10000
+              protocol: TCP
+              containerPort: 10000
+          resources:
+            limits:
+              cpu: 1000m
+              memory: 1536Mi
+            requests:
+              cpu: 100m
+              memory: 1536Mi
+          env:
+            - name: LS_JAVA_OPTS
+              value: "-Xmx1g -Xms1g"
+          volumeMounts:
+            - name: logstashpipeline
+              mountPath: /usr/share/logstash/pipeline/logstash.conf
+              subPath: logstash.conf
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mock-http-output
+spec:
+  selector:
+    app: mock-http-output
+  ports:
+    - protocol: TCP
+      port: 8080
+      targetPort: 8080
+  type: ClusterIP
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mock-http-output
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mock-http-output
+  template:
+    metadata:
+      labels:
+        app: mock-http-output
+    spec:
+      containers:
+        - name: mock-http-output
+          image: mock-http-output:v0
+          ports:
+            - containerPort: 8080

@@ -1,0 +1,350 @@
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: otel-collector-config
+data:
+  config.yaml: |-
+    receivers:
+      # See the full configuration of the receiver here: https://github.com/open-telemetry/opentelemetry-collector-contrib/tree/main/receiver/filelogreceiver#configuration
+      filelog:
+        include:
+          # Kubernetes also stores containers logs in this location
+          - /var/log/pods/*/*/*.log
+        exclude:
+          # Exclude logs from all containers named otel-collector
+          - /var/log/pods/*/otel-collector/*.log
+        start_at: beginning
+        include_file_path: true
+        include_file_name: false
+        operators:
+          # Depending on the container runtime, logs will be stored in a different format.
+          # Here we use the router operator to continue with the parser that matches the format used by Kubernetes.
+          # When it's done, we jump to the "extract_metadata_from_filepath" operator.
+          # Learn more about the router operator in the documentation: https://github.com/open-telemetry/opentelemetry-collector-contrib/blob/main/pkg/stanza/docs/operators/router.md
+          # Learn more about the regex_parser operator in the documentation: https://github.com/open-telemetry/opentelemetry-collector-contrib/blob/main/pkg/stanza/docs/operators/regex_parser.md
+          - type: router
+            id: get-format
+            routes:
+              - output: parser-docker
+                expr: 'body matches "^\\{"'
+              - output: parser-crio
+                expr: 'body matches "^[^ Z]+ "'
+              - output: parser-containerd
+                expr: 'body matches "^[^ Z]+Z"'
+          # Parse CRI-O format
+          - type: regex_parser
+            id: parser-crio
+            regex: '^(?P<time>[^ Z]+) (?P<stream>stdout|stderr) (?P<logtag>[^ ]*) ?(?P<log>.*)$'
+            output: extract_metadata_from_filepath
+            timestamp:
+              parse_from: attributes.time
+              layout_type: gotime
+              layout: '2006-01-02T15:04:05.999999999Z07:00'
+          # Parse CRI-Containerd format
+          - type: regex_parser
+            id: parser-containerd
+            regex: '^(?P<time>[^ ^Z]+Z) (?P<stream>stdout|stderr) (?P<logtag>[^ ]*) ?(?P<log>.*)$'
+            output: extract_metadata_from_filepath
+            timestamp:
+              parse_from: attributes.time
+              layout: '%Y-%m-%dT%H:%M:%S.%LZ'
+          # Parse Docker format
+          - type: json_parser
+            id: parser-docker
+            output: extract_metadata_from_filepath
+            timestamp:
+              parse_from: attributes.time
+              layout: '%Y-%m-%dT%H:%M:%S.%LZ'
+          # Here we use the regex_parser operator again in order to extract metadata from file path.
+          - type: regex_parser
+            id: extract_metadata_from_filepath
+            regex: '^.*\/(?P<namespace>[^_]+)_(?P<pod_name>[^_]+)_(?P<uid>[a-f0-9\-]{36})\/(?P<container_name>[^\._]+)\/(?P<restart_count>\d+)\.log$'
+            parse_from: attributes["log.file.path"]
+            cache:
+              size: 128  # default maximum amount of Pods per Node is 110. Should this be configurable in the LoggingStack CRD?
+          # Update body field after finishing all parsing
+          - type: move
+            from: attributes.log
+            to: body
+          # Rename attributes
+          - type: move
+            from: attributes.stream
+            to: attributes["log.iostream"]
+          - type: move
+            from: attributes.container_name
+            to: resource["k8s.container.name"]
+          - type: move
+            from: attributes.namespace
+            to: resource["k8s.namespace.name"]
+          - type: move
+            from: attributes.pod_name
+            to: resource["k8s.pod.name"]
+          - type: move
+            from: attributes.restart_count
+            to: resource["kubernetes.container.restart_count"]
+          - type: move
+            from: attributes.uid
+            to: resource["k8s.pod.uid"]
+
+    processors:
+      # Read the documentation for more detail about the full configuration of the k8sattributes processor
+      # https://github.com/open-telemetry/opentelemetry-collector-contrib/tree/main/processor/k8sattributesprocessor
+      k8sattributes:
+        auth_type: "serviceAccount"
+        passthrough: false
+        filter:
+          # Applying a discovery filter so that the processor only discovers pods from the same host that it is running on.
+          # Not using such a filter can result in unnecessary resource usage especially on very large clusters.
+          # Once the filter is applied, each processor will only query the k8s API for pods running on its own node.
+          # Read more here: https://github.com/open-telemetry/opentelemetry-collector-contrib/blob/main/processor/k8sattributesprocessor/README.md#as-an-agent
+          # The KUBE_NODE_NAME must be set in the Daemonset (see below).
+          node_from_env_var: KUBE_NODE_NAME
+        extract:
+          metadata:
+            - k8s.namespace.name
+            - k8s.pod.name
+            - k8s.pod.uid
+            - k8s.deployment.name
+            - k8s.replicaset.name
+            - k8s.daemonset.name
+            - k8s.statefulset.name
+            - k8s.container.name
+            - k8s.job.name
+            - k8s.cronjob.name
+            - k8s.node.name
+            - container.id
+            - container.image.name
+            - container.image.tag
+          # Collect custom annotations from pods, here we do the same thing as with the add_kubernetes_metadata Filebeat collector.
+          # The difference is that we directly have the logging.fleet.ubisoft.com/channel-name annotation named metadata.channel_name instead of using an additional copy_fields processor.
+          annotations:
+            - tag_name: kubernetes.annotations.logging_fleet_ubisoft_com.ignore-logs
+              key: logging.fleet.ubisoft.com/ignore-logs
+              from: pod
+            - tag_name: metadata.channel_name
+              key: logging.fleet.ubisoft.com/channel-name
+              from: pod
+        pod_association:
+          # Below association takes a look at the datapoint's k8s.pod.ip resource attribute and tries to match it with
+          # the pod having the same attribute.
+          - sources:
+              - from: resource_attribute
+                name: k8s.pod.ip
+          # Below association matches for pair `k8s.pod.name` and `k8s.namespace.name`
+          - sources:
+              - from: resource_attribute
+                name: k8s.pod.name
+              - from: resource_attribute
+                name: k8s.namespace.name
+      
+      # Read the documentation for more detail about the full configuration of the filter processor
+      # https://github.com/open-telemetry/opentelemetry-collector-contrib/blob/main/processor/filterprocessor/README.md
+      # Here we reproduce the same behavior as the one of the drop_event Filebeat collector.
+      filter:
+        error_mode: ignore
+        logs:
+          exclude:
+            match_type: strict
+            resource_attributes:
+              - key: kubernetes.annotations.logging_fleet_ubisoft_com.ignore-logs
+                value: "true"
+      
+      # Read the documentation for more detail about the full configuration of the resource processor
+      # https://github.com/open-telemetry/opentelemetry-collector-contrib/tree/main/processor/resourceprocessor
+      resource:
+        attributes:
+          # Once we've filtered the pods that have set the logging.fleet.ubisoft.com/ignore-logs annotation to "true", we can delete this attribute,
+          # just as we do with the drop_fields Filebeat processor.
+          - key: kubernetes.annotations.logging_fleet_ubisoft_com.ignore-logs
+            action: delete
+          # rename k8s.namespace.name into kubernetes.namespace to match legacy metadata
+          - key: kubernetes.namespace
+            from_attribute: k8s.namespace.name
+            action: upsert
+          - key: k8s.namespace.name
+            action: delete
+          # rename k8s.pod.name into kubernetes.pod.name to match legacy metadata
+          - key: kubernetes.pod.name
+            from_attribute: k8s.pod.name
+            action: upsert
+          - key: k8s.pod.name
+            action: delete
+          # rename k8s.pod.uid into kubernetes.pod.uid to match legacy metadata
+          - key: kubernetes.pod.uid
+            from_attribute: k8s.pod.uid
+            action: upsert
+          - key: k8s.pod.uid
+            action: delete
+          # rename k8s.deployment.name into kubernetes.deployment.name to match legacy metadata
+          - key: kubernetes.deployment.name
+            from_attribute: k8s.deployment.name
+            action: upsert
+          - key: k8s.deployment.name
+            action: delete
+          # rename k8s.replicaset.name into kubernetes.replicaset.name to match legacy metadata
+          - key: kubernetes.replicaset.name
+            from_attribute: k8s.replicaset.name
+            action: upsert
+          - key: k8s.replicaset.name
+            action: delete
+          # rename k8s.daemonset.name into kubernetes.daemonset.name to match legacy metadata
+          - key: kubernetes.daemonset.name
+            from_attribute: k8s.daemonset.name
+            action: upsert
+          - key: k8s.daemonset.name
+            action: delete
+          # rename k8s.statefulset.name into kubernetes.statefulset.name to match legacy metadata
+          - key: kubernetes.statefulset.name
+            from_attribute: k8s.statefulset.name
+            action: upsert
+          - key: k8s.statefulset.name
+            action: delete
+          # rename k8s.container.name into kubernetes.container.name to match legacy metadata
+          - key: kubernetes.container.name
+            from_attribute: k8s.container.name
+            action: upsert
+          - key: k8s.container.name
+            action: delete
+          # rename k8s.job.name into kubernetes.job.name to match legacy metadata
+          - key: kubernetes.job.name
+            from_attribute: k8s.job.name
+            action: upsert
+          - key: k8s.job.name
+            action: delete
+          # rename k8s.cronjob.name into kubernetes.cronjob.name to match legacy metadata
+          - key: kubernetes.cronjob.name
+            from_attribute: k8s.cronjob.name
+            action: upsert
+          - key: k8s.cronjob.name
+            action: delete
+          # rename k8s.node.name into kubernetes.node.name to match legacy metadata
+          - key: kubernetes.node.name
+            from_attribute: k8s.node.name
+            action: upsert
+          - key: k8s.node.name
+            action: delete
+    
+    exporters:
+      otlphttp:
+        logs_endpoint: http://logstash-pipelines-inputs.default.svc.cluster.local:10000
+        compression: none
+    
+    service:
+      pipelines:
+        logs:
+          receivers: [ filelog ]
+          processors: [ k8sattributes, filter, resource ]
+          exporters: [ otlphttp ]
+          
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: otel-collector
+---
+kind: ClusterRole
+apiVersion: rbac.authorization.k8s.io/v1
+metadata:
+  name: otel-collector
+rules:
+  # The Kubernetes Attributes processor needs a few cluster wide permissions.
+  # See https://github.com/open-telemetry/opentelemetry-collector-contrib/blob/main/processor/k8sattributesprocessor/README.md#role-based-access-control
+  - apiGroups: [ "" ]
+    resources: [ "pods", "namespaces", "nodes" ]
+    verbs: [ "get", "list", "watch" ]
+  - apiGroups: [ "apps" ]
+    resources: [ "replicasets", "deployments", "daemonsets", "statefulsets" ]
+    verbs: [ "get", "list", "watch" ]
+  - apiGroups: [ "batch" ]
+    resources: [ "jobs", "cronjobs" ]
+    verbs: [ "get", "list", "watch" ]
+---
+kind: ClusterRoleBinding
+apiVersion: rbac.authorization.k8s.io/v1
+metadata:
+  name: otel-collector
+subjects:
+  - kind: ServiceAccount
+    name: otel-collector
+    namespace: default
+roleRef:
+  kind: ClusterRole
+  name: otel-collector
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: otel-collector
+  labels:
+    app: opentelemetry
+    component: otel-collector
+spec:
+  selector:
+    matchLabels:
+      app: opentelemetry
+      component: otel-collector
+  template:
+    metadata:
+      labels:
+        app: opentelemetry
+        component: otel-collector
+    spec:
+      serviceAccountName: otel-collector
+      containers:
+        - name: otel-collector
+          image: "otel/opentelemetry-collector-contrib:0.85.0"
+          env:
+            # Configure the KUBE_NODE_NAME environment required by the Kubernetes Attributes processor (see above).
+            - name: KUBE_NODE_NAME
+              valueFrom:
+                fieldRef:
+                  apiVersion: v1
+                  fieldPath: spec.nodeName
+          args:
+            - --config
+            - /etc/otelcol-contrib/config.yaml
+          resources:
+            limits:
+              cpu: 100m
+              memory: 1Gi
+            requests:
+              cpu: 100m
+              memory: 1Gi
+          volumeMounts:
+            - name: varlogpods
+              mountPath: /var/log/pods
+              readOnly: true
+            - name: varlibdockercontainers
+              mountPath: /var/lib/docker/containers
+              readOnly: true
+            - mountPath: /etc/otelcol-contrib/config.yaml
+              name: data
+              subPath: config.yaml
+              readOnly: true
+      terminationGracePeriodSeconds: 30
+      volumes:
+        - name: varlogpods
+          hostPath:
+            path: /var/log/pods
+        - name: varlibdockercontainers
+          hostPath:
+            path: /var/lib/docker/containers
+        - name: data
+          configMap:
+            name: otel-collector-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: otel-collector
+  labels:
+    app: opentelemetry
+    component: otel-collector
+spec:
+  ports:
+    - name: metrics
+      port: 8888
+  selector:
+    component: otel-collector
